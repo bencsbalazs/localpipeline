@@ -6,14 +6,10 @@ echo "=== Installing Pipeline Tools ==="
 # 1. System dependencies (Docker, curl, etc.) on Ubuntu/Debian basics
 echo "Please ensure Docker is installed."
 
-# 2. Python dependencies (Ruff, Pytest, etc.)
-# echo "Installing Python packages..."
-# python3 -m pip install -r requirements.txt
+BIN_DIR="$HOME/.local/bin"
+mkdir -p $BIN_DIR
 
-# BIN_DIR="$HOME/.local/bin"
-# mkdir -p $BIN_DIR
-
-# 3. Installing Kind (Kubernetes in Docker)
+# 2. Installing Kind (Kubernetes in Docker)
 if ! command -v kind &> /dev/null; then
     echo "Kind installing..."
     curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64

@@ -2,6 +2,13 @@
 set -eo pipefail
 
 export PATH=$HOME/.local/bin:$PATH
+
+echo -e "${BLUE}=== Setting up Python Virtual Environment ===${NC}"
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --no-cache-dir -r requirements.txt
+echo -e "${GREEN}=== Python Virtual Environment Setup Complete ===${NC}"
+
 # Color codes for the terminal presentation
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -50,7 +57,7 @@ handle_failure_with_ai() {
 
     echo -e "${BLUE}[AI] Asking Ollama ($OLLAMA_MODEL) for a fix...${NC}"
     
-    local ai_response=$(curl -s -X POST http://localhost:11434/api/generate \
+    local ai_response=$(curl -s -X POST http://ollama-service:11434/api/generate \
         -H "Content-Type: application/json" \
         -d "$jq_escaped_prompt")
 
@@ -109,36 +116,65 @@ step_1_lint() {
 }
 
 step_2_test() {
-    echo -e "\n[2/7] Running unit tests (Pytest)..."
+    echo -e "\n[2/8] Running unit tests (Pytest)..."
     local output
-    if ! output=$(python3 test.py 2>&1); then
+    if ! output=$(python3 -m pytest 2>&1); then
         echo -e "${RED}Test failed! Pipeline stopped.${NC}"
         handle_failure_with_ai "test" "$output"
     fi
 }
 
-step_3_dependency_scan() {
-    echo -e "\n[3/7] Scanning third-party dependencies (Snyk)..."
+step_3_sonar_scan() {
+    echo -e "\n[3/8] Running SonarQube scan..."
+    # Ensure SonarQube server is running, e.g., via Docker: docker run -d --name sonarqube -p 9000:9000 sonarqube:latest
+    # Default SonarQube URL and Token, override with environment variables if needed
+    local SONAR_HOST_URL="${SONAR_HOST_URL:-http://localhost:9000}"
+    local SONAR_TOKEN="${SONAR_TOKEN:-}"
+
+    if [ -z "$SONAR_TOKEN" ]; then
+        echo -e "${RED}Warning: SONAR_TOKEN is not set. SonarQube scan might fail or run in analysis mode without authentication.${NC}"
+    fi
+
+    local output
+    if ! output=$(docker run --rm \
+        -v "$(pwd):/usr/src" \
+        sonarsource/sonar-scanner-cli \
+        -Dsonar.projectKey=local-app \
+        -Dsonar.sources=. \
+        -Dsonar.host.url="${SONAR_HOST_URL}" \
+        -Dsonar.login="${SONAR_TOKEN}" 2>&1); then
+        echo -e "${RED}SonarQube scan failed!${NC}"
+        handle_failure_with_ai "sonar-scan" "$output"
+    fi
+}
+
+step_4_dependency_scan() {
+    echo -e "\n[4/8] Scanning third-party dependencies (Snyk)..."
     snyk test --file=requirements.txt || echo -e "${RED}Snyk identification missing, step skipped (simulation mode).${NC}"
 }
 
-step_4_secret_scan() {
-    echo -e "\n[4/7] Scanning for hardcoded secrets (Gitleaks)..."
+step_4_dependency_scan() {
+    echo -e "\n[4/8] Scanning third-party dependencies (Snyk)..."
+    snyk test --file=requirements.txt || echo -e "${RED}Snyk identification missing, step skipped (simulation mode).${NC}"
+}
+
+step_5_secret_scan() {
+    echo -e "\n[5/8] Scanning for hardcoded secrets (Gitleaks)..."
     gitleaks detect --source=. -v --no-git || { echo -e "${RED}Critical error: Hardcoded secret found!${NC}"; exit 1; }
 }
 
-step_5_build() {
-    echo -e "\n[5/7] Building Docker Image (Multi-stage build)..."
+step_6_build() {
+    echo -e "\n[6/8] Building Docker Image (Multi-stage build)..."
     docker build -t local-app:latest .
 }
 
-step_6_image_scan() {
-    echo -e "\n[6/7] Scanning the built Docker Image (Trivy)..."
+step_7_image_scan() {
+    echo -e "\n[7/8] Scanning the built Docker Image (Trivy)..."
     trivy image --severity HIGH,CRITICAL local-app:latest || { echo -e "${RED}Security check rejected the image!${NC}"; exit 1; }
 }
 
-step_7_kubernetes_deploy() {
-    echo -e "\n[7/7] Preparing local Kubernetes (Kind) cluster..."
+step_8_kubernetes_deploy() {
+    echo -e "\n[8/8] Preparing local Kubernetes (Kind) cluster..."
     
     # 1. If an old cluster is already running, delete it for a clean slate
     if kind get clusters | grep -q "local-pipeline-cluster"; then
@@ -149,18 +185,36 @@ step_7_kubernetes_deploy() {
     # 2. Creating a new cluster
     kind create cluster --name local-pipeline-cluster
 
-    echo -e "\n[7/7.b] Loading the secure Docker Image into the K8s cluster..."
+    echo -e "\n[8/8.b] Loading the secure Docker Image into the K8s cluster..."
     # This is the key step: pushing the locally Trivy-checked image into K8s without a registry
     kind load docker-image local-app:latest --name local-pipeline-cluster
 
-    echo -e "\n[7/7.c] Deploying the application using the deployment manifest..."
+    echo -e "\n[8/8.c] Deploying the application using the deployment manifest..."
     kubectl apply -f k8s/deployment.yml
+
+    echo -e "\n[8/8.d] Deploying Ollama LLM service..."
+    kubectl apply -f k8s/ollama.yml
+    
+    echo -e "\n[8/8.e] Deploying Zookeeper and Kafka message queue..."
+    kubectl apply -f k8s/kafka.yml
+
+    echo -e "\n[8/8.f] Deploying Elasticsearch and Kibana logging stack..."
+    kubectl apply -f k8s/logging.yml
+
+    echo -e "\n[8/8.g] Deploying Logstash to process logs from Kafka to Elasticsearch..."
+    kubectl apply -f k8s/logstash.yml
 
     echo "Waiting for Pods to start (Kubernetes Orchestration)..."
     # Replacing manual check, waiting for all Pods to be "Ready"
     kubectl rollout status deployment/local-app-deployment --timeout=60s
+    kubectl rollout status deployment/ollama-deployment --timeout=300s # Ollama might take longer to pull model
+    kubectl rollout status deployment/zookeeper-deployment --timeout=120s
+    kubectl rollout status deployment/kafka-deployment --timeout=120s
+    kubectl rollout status deployment/elasticsearch-deployment --timeout=180s
+    kubectl rollout status deployment/kibana-deployment --timeout=180s
+    kubectl rollout status deployment/logstash-deployment --timeout=180s
 
-    echo -e "\n[7/7.d] Starting local port-forward for testing..."
+    echo -e "\n[8/8.h] Starting local port-forward for testing..."
     # Running port-forward in the background to access from browser
     kubectl port-forward svc/local-app-service 8080:8080 &
     PID_FORWARD=$!
@@ -180,10 +234,11 @@ step_7_kubernetes_deploy() {
 # Running in order
 step_1_lint
 step_2_test
-step_3_dependency_scan
-step_4_secret_scan
-step_5_build
-step_6_image_scan
-step_7_kubernetes_deploy
+step_3_sonar_scan
+step_4_dependency_scan
+step_5_secret_scan
+step_6_build
+step_7_image_scan
+step_8_kubernetes_deploy
 
 echo -e "\n${GREEN}=== SUCCESS: THE LOCAL PIPELINE HAS PASSED ALL GATES ===${NC}"

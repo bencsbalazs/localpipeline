@@ -3,3 +3,4 @@ requests
 ruff
 pytest
 pyjwt
+kafka-python
